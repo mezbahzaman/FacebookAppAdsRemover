@@ -45,3 +45,10 @@ class CleanUrlHookTest {
         assertEquals(dest, extractDestination(wrapper("u=${enc(dest)}#fragment&fbclid=x")))
     }
 
+    @Test fun nonWrapperAndMalformedUrlsReturnNull() {
+        assertNull(extractDestination("https://example.org/a?b=1&fbclid=x"))
+        assertNull(extractDestination(wrapper("fbclid=x")))
+        assertNull(extractDestination(wrapper("u=&fbclid=x")))
+        assertNull(extractDestination(""))
+    }
+}
