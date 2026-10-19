@@ -118,6 +118,14 @@ object VideoResumeHook {
 
     /** The hooked methods (mod keeps one callback across all hooked methods). */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
+
+    /**
+     * Tracking methods already hooked, by [Method.toGenericString]. Guards
+     * against masking a partial install: the old `hookHandles.isNotEmpty()`
+     * early return meant that if one of start/stop/seek failed, a later retry
+     * reported success without ever installing the missing hook.
+     */
+    private val hookedPlayerMethods = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var lifecycleRegistered = false
 
     // Resolved-once members of the player class (all structural — see KDoc).
@@ -262,7 +270,6 @@ object VideoResumeHook {
      */
     fun hookPlayerClass(module: XposedInterface, classLoader: ClassLoader, className: String,
                         positionName: String? = null): Boolean {
-        if (hookHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(className, false, classLoader)
         }.getOrNull() ?: run {
@@ -328,11 +335,21 @@ object VideoResumeHook {
 
         var installed = 0
         for (m in listOfNotNull(start, stop, seek)) {
+            val key = m.toGenericString()
+            if (!hookedPlayerMethods.add(key)) {
+                installed++
+                continue
+            }
             runCatching {
                 m.isAccessible = true
                 hookHandles.add(module.hook(m).intercept(TrackHooker))
                 installed++
-            }.onFailure { L.w(TAG, "hook failed on ${cls.name}.${m.name}", it) }
+            }.onFailure {
+                // Retry this exact method on the next pass instead of treating
+                // the class as done.
+                hookedPlayerMethods.remove(key)
+                L.w(TAG, "hook failed on ${cls.name}.${m.name}", it)
+            }
         }
         if (installed < 3 || params == null || position == null) {
             L.w(TAG, "player member resolution incomplete on $className " +

@@ -518,18 +518,32 @@ object GameAdsHook {
 
     /** Hooks a native request handler (void, JSONObject payload). */
     private fun hookRequest(module: XposedInterface, method: Method) {
-        if (!gameAdMethodsHooked.add(methodHookKey(method))) return
-        method.isAccessible = true
-        module.hook(method).intercept(RequestHooker(method))
-        L.i(TAG, "hooked game ad request ${method.declaringClass.name}.${method.name}")
+        val key = methodHookKey(method)
+        if (!gameAdMethodsHooked.add(key)) return
+        runCatching {
+            method.isAccessible = true
+            module.hook(method).intercept(RequestHooker(method))
+            L.i(TAG, "hooked game ad request ${method.declaringClass.name}.${method.name}")
+        }.onFailure {
+            // Roll the dedup key back, or a failed hook would never be
+            // retried by a later discovery pass.
+            gameAdMethodsHooked.remove(key)
+            L.w(TAG, "game ad request hook failed for ${method.declaringClass.name}.${method.name}", it)
+        }
     }
 
     /** Hooks a JS bridge entry method (String payload). */
     private fun hookBridgeEntry(module: XposedInterface, method: Method, source: String) {
-        if (!gameAdMethodsHooked.add(methodHookKey(method))) return
-        method.isAccessible = true
-        module.hook(method).intercept(BridgeHooker(method))
-        L.i(TAG, "hooked game ad bridge entry ${method.declaringClass.name}.${method.name} via $source")
+        val key = methodHookKey(method)
+        if (!gameAdMethodsHooked.add(key)) return
+        runCatching {
+            method.isAccessible = true
+            module.hook(method).intercept(BridgeHooker(method))
+            L.i(TAG, "hooked game ad bridge entry ${method.declaringClass.name}.${method.name} via $source")
+        }.onFailure {
+            gameAdMethodsHooked.remove(key)
+            L.w(TAG, "game ad bridge hook failed for ${method.declaringClass.name}.${method.name}", it)
+        }
     }
 
     /**
@@ -767,14 +781,21 @@ object GameAdsHook {
         }
 
         entryMethods.forEach { method ->
-            if (!gameAdMethodsHooked.add(methodHookKey(method))) return@forEach
+            val key = methodHookKey(method)
+            if (!gameAdMethodsHooked.add(key)) return@forEach
+            val module = moduleHooker
+            if (module == null) {
+                // No module handle yet: leave the method untracked so the next
+                // pass retries instead of silently skipping it forever.
+                gameAdMethodsHooked.remove(key)
+                return@forEach
+            }
             runCatching {
                 method.isAccessible = true
-                moduleHooker?.let { module ->
-                    module.hook(method).intercept(BridgeHooker(method))
-                    L.i(TAG, "hooked game bridge entry ${bridgeClass.name}.${method.name} via $source")
-                }
+                module.hook(method).intercept(BridgeHooker(method))
+                L.i(TAG, "hooked game bridge entry ${bridgeClass.name}.${method.name} via $source")
             }.onFailure {
+                gameAdMethodsHooked.remove(key)
                 L.w(TAG, "game bridge entry hook failed ${bridgeClass.name}.${method.name}", it)
             }
         }
@@ -1963,8 +1984,12 @@ object GameAdsHook {
             val snapshot = gameAdPromiseSnapshots[promiseId] ?: return@forEach
             if (!shouldForceGameAdSuccess(snapshot.payload, snapshot.messageType)) return@forEach
 
-            val rewritten = rewritePromiseJsonInDelivery(delivery, promiseId, snapshot) ?: return@forEach
-            if (rewritten != delivery) {
+            // Rewrite from the accumulated string: a delivery can carry more
+            // than one promise id, and rebuilding from the pristine `delivery`
+            // each time would silently discard the earlier rewrites.
+            val rewritten = rewritePromiseJsonInDelivery(result ?: delivery, promiseId, snapshot)
+                ?: return@forEach
+            if (rewritten != (result ?: delivery)) {
                 result = rewritten
             }
         }
@@ -2053,6 +2078,7 @@ object GameAdsHook {
      * reason.
      */
     private fun forceSuccessDeep(json: JSONObject, reward: Boolean) {
+        var hadError = false
         val keys = ArrayList<String>()
         val keyIterator = json.keys()
         while (keyIterator.hasNext()) {
@@ -2062,13 +2088,18 @@ object GameAdsHook {
             val value = json.opt(key)
             when {
                 key == "error" || key == "errorMessage" ||
-                    (key == "code" && json.opt(key) is String) ->
+                    (key == "code" && json.opt(key) is String) -> {
+                    // Remember it before dropping: the condition below used to
+                    // test json.has("error") *after* removal, so an error-only
+                    // payload never had success forced.
+                    hadError = true
                     json.remove(key)
+                }
                 value is JSONObject -> forceSuccessDeep(value, reward)
                 else -> Unit
             }
         }
-        if (json.has("success") || json.has("error") || reward || json.has("completed")) {
+        if (json.has("success") || hadError || reward || json.has("completed")) {
             json.put("success", true)
             if (reward) {
                 json.put("completed", true)

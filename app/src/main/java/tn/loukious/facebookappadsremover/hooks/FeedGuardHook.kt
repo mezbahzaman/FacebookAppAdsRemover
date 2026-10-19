@@ -310,7 +310,8 @@ object FeedGuardHook {
             val hook = resolveLateHookForClass(cls, LateFeedShape.STORAGE)
             if (hook != null && hookLateFeedList(module, hook)) {
                 hooked++
-                found.add(ROLE_LATE + hook.method.declaringClass.name)
+                found.add(FeedGuardCacheEntry.format(
+                    ROLE_LATE, hook.method.declaringClass.name, LateFeedShape.STORAGE.name))
             }
         }
 
@@ -318,7 +319,8 @@ object FeedGuardHook {
             val hook = resolveLateHookForClass(cls, LateFeedShape.VENDING)
             if (hook != null && hookLateFeedList(module, hook)) {
                 hooked++
-                found.add(ROLE_LATE + hook.method.declaringClass.name)
+                found.add(FeedGuardCacheEntry.format(
+                    ROLE_LATE, hook.method.declaringClass.name, LateFeedShape.VENDING.name))
             }
         }
 
@@ -327,7 +329,8 @@ object FeedGuardHook {
             val hook = resolveLateHookForClass(cls, LateFeedShape.LIFECYCLE)
             if (hook != null && hookLateFeedList(module, hook)) {
                 hooked++
-                found.add(ROLE_LATE + hook.method.declaringClass.name)
+                found.add(FeedGuardCacheEntry.format(
+                    ROLE_LATE, hook.method.declaringClass.name, LateFeedShape.LIFECYCLE.name))
             }
         }
         L.i(TAG, "late-feed sanitizers: $hooked hook(s)")
@@ -404,7 +407,16 @@ object FeedGuardHook {
                         }
                     }
                     ROLE_LATE -> {
-                        val hook = resolveLateHookForClass(cls) ?: return@runCatching
+                        // Prefer the persisted shape: it names the exact method
+                        // the DexKit discovery hooked. Without it a class that
+                        // matches two shapes resolves as ambiguous and forces a
+                        // full rescan on every launch.
+                        val shape = parsed.lateShape?.let { name ->
+                            LateFeedShape.values().firstOrNull { it.name == name }
+                        }
+                        val hook = if (shape != null) resolveLateHookForClass(cls, shape)
+                            else resolveLateHookForClass(cls)
+                        hook ?: return@runCatching
                         if (hookLateFeedList(module, hook)) {
                             installed++
                             installedLate++
@@ -863,8 +875,12 @@ object FeedGuardHook {
         private fun filterResult(result: Any?, filter: FeedFilterEngine): Any? = runCatching {
             val items = extractFeedItemsFromResult(result) ?: return@runCatching null
             val partition = filter.partition(items)
-            FeedFilterDiagnostics.batch(FeedPipeline.CSR_CACHE, partition)
+            // The before-phase already counted this call's inspected items; the
+            // after-phase inspects the list it just filtered, so its zero-removal
+            // pass would merely double the inspected totals. Only count a result
+            // pass that actually removes something (the method re-added items).
             if (partition.removed <= 0) return@runCatching null
+            FeedFilterDiagnostics.batch(FeedPipeline.CSR_CACHE, partition)
             val rebuilt = rebuildFeedResult(result ?: return@runCatching null, partition.kept)
                 ?: return@runCatching null
             logHookHitThrottled("csrFilterOut", hookMethod) {

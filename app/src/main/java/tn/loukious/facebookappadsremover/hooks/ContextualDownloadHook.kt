@@ -231,28 +231,34 @@ object ContextualDownloadHook {
         storyRuntime = runtime
         var installed = 0
 
-        if (hookedStoryBuilders.add(builder)) {
+        if (!hookedStoryBuilders.contains(builder)) {
             runCatching {
                 builder.isAccessible = true
                 module.hook(builder).intercept(StoryMenuBuilderHook)
+                hookedStoryBuilders.add(builder)
                 installed++
             }.onFailure { L.w(TAG, "story menu-builder hook failed", it) }
         }
-        if (hookedStoryCapabilities.add(capability)) {
+        if (!hookedStoryCapabilities.contains(capability)) {
             runCatching {
                 capability.isAccessible = true
                 module.hook(capability).intercept(StoryCapabilityHook)
+                hookedStoryCapabilities.add(capability)
                 installed++
             }.onFailure { L.w(TAG, "story capability hook failed", it) }
         }
-        if (hookedStoryHandlers.add(handler)) {
+        if (!hookedStoryHandlers.contains(handler)) {
             runCatching {
                 handler.isAccessible = true
                 module.hook(handler).intercept(StoryActionHook)
+                hookedStoryHandlers.add(handler)
                 installed++
             }.onFailure { L.w(TAG, "story action hook failed", it) }
         }
 
+        // A method enters its set only after its hook is in place, so this
+        // means "all three were hooked successfully at some point" — a failed
+        // hook stays out of the set and is retried on the next discovery.
         return installed > 0 ||
             (hookedStoryBuilders.contains(builder) &&
                 hookedStoryCapabilities.contains(capability) &&

@@ -208,6 +208,20 @@ object DownloadHook {
     private val dlIo: ExecutorService = Executors.newSingleThreadExecutor()
 
     /**
+     * One OkHttp client for every request the module makes inside Facebook.
+     * Building a fresh `OkHttpClient` per call (page fetch, media stream,
+     * thumbnail head) created a new connection pool and dispatcher thread
+     * each time; per-call differences are applied through `newBuilder()`,
+     * which shares the pool and threads.
+     */
+    private val httpClient: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
      * Decoded card thumbnails, keyed by album-art URL or "frame:<videoId>".
      * The mod extracts videoThumbnail once at capture time and persists it in
      * VideoPlaylist.json, so its list always serves the image synchronously —
@@ -223,6 +237,17 @@ object DownloadHook {
 
     /** The hook handles (mod keeps one callback across all hooked methods). */
     private val hookHandles = ArrayList<XposedInterface.HookHandle>()
+
+    /**
+     * Methods already successfully hooked by [hookPlayerClass] /
+     * [hookMediaSetupClass], keyed by [Method.toGenericString]. A failed hook
+     * (or a retry after a partial install) must be able to install the
+     * remaining methods without double-hooking the ones that succeeded.
+     */
+    private val hookedPlayerMethods = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Same idea for the media-setup controller's observer hooks. */
+    private val hookedMediaSetupMethods = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /** Current activity tracker — the mod's X/D92k.solarOrbitBridge(). */
     @Volatile private var currentActivity: Activity? = null
@@ -269,15 +294,18 @@ object DownloadHook {
                 data
             }
             videosById[data.videoId] = chosen
+            // Rebuild the ring under the same lock: the media-setup and
+            // params-ctor hookers can capture on different threads, and two
+            // unlocked read-modify-writes would drop one of the entries.
+            recentVideos = buildList {
+                add(chosen)
+                for (v in recentVideos) {
+                    if (v.videoId != chosen.videoId && size < 15) add(v)
+                }
+            }
             chosen
         }
         current = stored
-        recentVideos = buildList {
-            add(stored)
-            for (v in recentVideos) {
-                if (v.videoId != stored.videoId && size < 15) add(v)
-            }
-        }
     }
 
     private fun videoById(videoId: String?): VideoData? {
@@ -1084,7 +1112,6 @@ object DownloadHook {
      */
     private fun hookMediaSetupClass(module: XposedInterface, classLoader: ClassLoader,
                                     className: String): Boolean {
-        if (mediaSetupHandles.isNotEmpty()) return true
         val cls = runCatching {
             Class.forName(className, false, classLoader)
         }.getOrNull() ?: run {
@@ -1105,11 +1132,19 @@ object DownloadHook {
         }
         var installed = 0
         for (m in targets) {
+            val key = m.toGenericString()
+            if (!hookedMediaSetupMethods.add(key)) {
+                installed++
+                continue
+            }
             runCatching {
                 m.isAccessible = true
                 mediaSetupHandles.add(module.hook(m).intercept(MediaSetupHooker))
                 installed++
-            }.onFailure { L.w(TAG, "hook failed on ${cls.name}.${m.name}", it) }
+            }.onFailure {
+                hookedMediaSetupMethods.remove(key)
+                L.w(TAG, "hook failed on ${cls.name}.${m.name}", it)
+            }
         }
         L.i(TAG, "media-setup capture hook installed on ${cls.name}: $installed method(s)")
         return installed > 0
@@ -1148,9 +1183,14 @@ object DownloadHook {
     /**
      * Reads the controller's GraphQLMedia + VideoPlayerParams (both by stable
      * type) and runs the mod's extraction pipeline on the dump. videoId comes
-     * from params.toString() ("VideoId: <id>") and falls back to the freshest
-     * params-ctor observation when the controller instance was built before
-     * playback params were attached.
+     * from params.toString() ("VideoId: <id>"); when the controller has not had
+     * its params attached yet the capture is skipped rather than guessed.
+     *
+     * The previous code fell back to the freshest params-ctor observation,
+     * which can belong to a different (prefetched/next) video — that attached
+     * one video's DASH ladder to another video's card. A missing rich capture
+     * is harmless (the params-ctor hook still records the SD/HD pair); a
+     * misattributed one is not.
      */
     private fun onMediaSetup(controller: Any?) {
         val paramsField = mediaParamsField ?: return
@@ -1159,7 +1199,6 @@ object DownloadHook {
         val params = runCatching { paramsField.get(controller) }.getOrNull()
         val videoId = params?.toString()?.removePrefix(VIDEO_ID_MARKER)
             ?.takeIf { it.isNotBlank() && it != NULL_MARKER }
-            ?: lastParamsVideoId?.takeIf { it.isNotBlank() && it != NULL_MARKER }
             ?: return
 
         // Same video: re-capture at most every 5s (the mod's freshness gate).
@@ -1209,7 +1248,6 @@ object DownloadHook {
      */
     private fun hookPlayerClass(module: XposedInterface, classLoader: ClassLoader,
                                 className: String): Boolean {
-        if (hookHandles.isNotEmpty()) return true
         val playerClass = runCatching {
             Class.forName(className, false, classLoader)
         }.getOrNull() ?: run {
@@ -1225,11 +1263,22 @@ object DownloadHook {
         }
         var installed = 0
         for (m in targets) {
+            val key = m.toGenericString()
+            if (!hookedPlayerMethods.add(key)) {
+                // Already hooked by an earlier pass.
+                installed++
+                continue
+            }
             runCatching {
                 m.isAccessible = true
                 hookHandles.add(module.hook(m).intercept(CaptureHooker))
                 installed++
-            }.onFailure { L.w(TAG, "hook failed on ${playerClass.name}.${m.name}", it) }
+            }.onFailure {
+                // Roll back so a later pass retries this exact method instead
+                // of treating the partial install as complete.
+                hookedPlayerMethods.remove(key)
+                L.w(TAG, "hook failed on ${playerClass.name}.${m.name}", it)
+            }
         }
         L.i(TAG, "capture hook installed on ${playerClass.name}: $installed method(s)")
         return installed > 0
@@ -1264,6 +1313,14 @@ object DownloadHook {
     @Volatile private var lastCaptureAt = 0L
 
     /**
+     * When the last *successful* capture of [lastVideoId] happened. Separate
+     * from [lastCaptureAt] (which stamps the expensive-pass throttle and is
+     * therefore set before the same-video gate is evaluated, making a gate
+     * that compared against it always true).
+     */
+    @Volatile private var lastVideoCaptureAt = 0L
+
+    /**
      * Scan the hooked method's arguments for the RichVideoPlayerParams (the
      * arg whose toString contains "VideoId: " and is not "VideoId: null"),
      * dump it and extract the quality ladder (libnc.so.c 16380–22320).
@@ -1296,7 +1353,7 @@ object DownloadHook {
 
         val videoId = extractVideoId(params) ?: return
         // Same video again: re-capture at most every 5s (quality may change).
-        if (videoId == lastVideoId && now - lastCaptureAt < 5000L) return
+        if (videoId == lastVideoId && now - lastVideoCaptureAt < 5000L) return
         val mediaMatch = GRAPHQL_MEDIA_REGEX.find(params) ?: return
         val mediaDump = mediaMatch.groupValues[1]
 
@@ -1305,6 +1362,7 @@ object DownloadHook {
         if (qualities.isEmpty() && playlist == null) return
 
         lastVideoId = videoId
+        lastVideoCaptureAt = now
         if (paramsClassName == null) {
             paramsClassName = params.javaClass.name
         }
@@ -1480,6 +1538,9 @@ object DownloadHook {
     /** Mod: APKMODDONE/FacebookExtract under the app's dataDir. */
     private const val EXTRACT_DIR = "APKMODDONE/FacebookExtract"
 
+    /** Upper bound on a fetched watch page (real ones are a few hundred KB). */
+    private const val MAX_PAGE_BYTES = 8L * 1024 * 1024
+
     /** Mod DAT_00fd3458 — desktop Chrome page-navigation UA. */
     private const val DESKTOP_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -1560,7 +1621,7 @@ object DownloadHook {
      */
     fun fetchQualities(pageUrl: String): FetchedQualities? {
         if (!pageUrl.startsWith("http://") && !pageUrl.startsWith("https://")) return null
-        val client = okhttp3.OkHttpClient.Builder()
+        val client = httpClient.newBuilder()
             .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
             .build()
@@ -1574,7 +1635,31 @@ object DownloadHook {
                 L.w(TAG, "FacebookExtract HTTP ${resp.code} for $pageUrl")
                 return null
             }
-            val body = resp.body?.string() ?: return null
+            // A login wall / redirect can answer with JSON or an image; parsing
+            // that as an HTML page yields nothing and hides the real reason.
+            val contentType = resp.header("Content-Type")
+            if (contentType != null &&
+                !contentType.contains("html", true) &&
+                !contentType.contains("xml", true) &&
+                !contentType.contains("text", true)
+            ) {
+                L.w(TAG, "FacebookExtract unexpected Content-Type '$contentType' for $pageUrl")
+                return null
+            }
+            // Bound the read: a wrong endpoint (or an endless stream) must not
+            // buffer an unbounded body into the Facebook process's heap.
+            val body = resp.body?.byteStream()?.use { input ->
+                val buffer = java.io.ByteArrayOutputStream()
+                val chunk = ByteArray(64 * 1024)
+                var total = 0L
+                while (total < MAX_PAGE_BYTES) {
+                    val n = input.read(chunk)
+                    if (n < 0) break
+                    buffer.write(chunk, 0, n)
+                    total += n
+                }
+                buffer.toByteArray().toString(Charsets.UTF_8)
+            } ?: return null
             persistExtract(pageUrl, body)
 
             val cleaned = SCRIPT_STRIP.replace(unescapePage(body), "")
@@ -1859,6 +1944,10 @@ object DownloadHook {
                         // possibly a newer one than this fetch started from —
                         // picks the cached bitmap up in getView.
                         main.post { notifyDataSetChanged() }
+                    } else {
+                        // Drop the in-flight marker so a later getView retries;
+                        // keeping it made a transient failure permanent.
+                        thumbRequested.remove(key)
                     }
                 }
             }
@@ -1917,7 +2006,7 @@ object DownloadHook {
 
         /** First ~4MB of a video URL — enough for the poster frame. */
         private fun downloadHead(url: String, out: File) {
-            val client = okhttp3.OkHttpClient.Builder()
+            val client = httpClient.newBuilder()
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                 .build()
@@ -2280,48 +2369,104 @@ object DownloadHook {
         recordHistory(url, ext)
     }
 
-    /** MeiOkHttp.downLoadFile port: stream to Movies/FB_Download/FB_<ts>.<ext>. */
+    /**
+     * Where a download of the given extension belongs. The mod only ever saved
+     * video/mp4; the port also offers the audio (M4A) and JPEG thumbnail items,
+     * and filing those as "video/m4a" / "video/jpg" in the video collection
+     * made galleries reject or misclassify them.
+     */
+    private class DownloadTarget(
+        val mime: String,
+        val collection: android.net.Uri,
+        val relativePath: String,
+        val legacyDir: String,
+    )
+
+    private fun downloadTarget(ext: String): DownloadTarget = when (ext.lowercase(Locale.US)) {
+        "m4a" -> audioTarget("audio/mp4")
+        "mp3" -> audioTarget("audio/mpeg")
+        "aac" -> audioTarget("audio/aac")
+        "ogg", "opus" -> audioTarget("audio/ogg")
+        "jpg", "jpeg" -> imageTarget("image/jpeg")
+        "png" -> imageTarget("image/png")
+        "webp" -> imageTarget("image/webp")
+        else -> DownloadTarget(
+            "video/mp4",
+            android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            Environment.DIRECTORY_MOVIES + "/FB_Download",
+            Environment.DIRECTORY_MOVIES,
+        )
+    }
+
+    private fun audioTarget(mime: String) = DownloadTarget(
+        mime,
+        android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+        Environment.DIRECTORY_MUSIC + "/FB_Download",
+        Environment.DIRECTORY_MUSIC,
+    )
+
+    private fun imageTarget(mime: String) = DownloadTarget(
+        mime,
+        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        Environment.DIRECTORY_PICTURES + "/FB_Download",
+        Environment.DIRECTORY_PICTURES,
+    )
+
+    /** MeiOkHttp.downLoadFile port: stream to <public dir>/FB_Download/FB_<ts>.<ext>. */
     private fun downloadDirect(url: String, ext: String) {
+        val target = downloadTarget(ext)
         dlIo.execute {
+            var pendingUri: android.net.Uri? = null
+            var pendingFile: File? = null
             runCatching {
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
                 val name = "FB_${stamp}.$ext"
-                val out: File
+                val savedName: String
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val values = android.content.ContentValues().apply {
-                        put(android.provider.MediaStore.Video.Media.DISPLAY_NAME, name)
-                        put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/$ext")
-                        put(android.provider.MediaStore.Video.Media.RELATIVE_PATH,
-                            Environment.DIRECTORY_MOVIES + "/FB_Download")
+                        put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(android.provider.MediaStore.MediaColumns.MIME_TYPE, target.mime)
+                        put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, target.relativePath)
                     }
                     val resolver = appContext.contentResolver
-                    val uri = resolver.insert(
-                        android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                    val uri = resolver.insert(target.collection, values)
                         ?: error("MediaStore insert failed")
+                    pendingUri = uri
                     resolver.openOutputStream(uri)?.use { os ->
                         stream(url, os)
                     } ?: error("openOutputStream failed")
-                    out = File(name)
+                    savedName = name
                 } else {
                     @Suppress("DEPRECATION")
                     val dir = File(
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                        Environment.getExternalStoragePublicDirectory(target.legacyDir),
                         "FB_Download",
                     )
                     dir.mkdirs()
-                    out = File(dir, name)
+                    val out = File(dir, name)
+                    pendingFile = out
                     out.outputStream().use { stream(url, it) }
+                    savedName = out.name
                 }
-                L.i(TAG, "downloaded ${out.name}")
+                L.i(TAG, "downloaded $savedName")
                 main.post {
-                    Toast.makeText(appContext, "Saved ${out.name}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(appContext, "Saved $savedName", Toast.LENGTH_LONG).show()
                 }
-            }.onFailure { L.e(TAG, "direct download failed", it) }
+            }.onFailure { error ->
+                L.e(TAG, "direct download failed (url=$url)", error)
+                // A half-written row/file would otherwise linger in the user's
+                // gallery as a truncated or 0-byte entry; remove it and say so.
+                pendingUri?.let { runCatching { appContext.contentResolver.delete(it, null, null) } }
+                pendingFile?.let { runCatching { it.delete() } }
+                main.post {
+                    Toast.makeText(appContext, "Download failed", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
     private fun stream(url: String, os: java.io.OutputStream) {
-        val client = okhttp3.OkHttpClient.Builder()
+        val client = httpClient.newBuilder()
             .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
             .build()

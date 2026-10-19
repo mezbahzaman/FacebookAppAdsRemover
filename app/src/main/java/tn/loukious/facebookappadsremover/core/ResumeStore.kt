@@ -112,9 +112,13 @@ object ResumeStore {
      * entry when the same video restarts within the 5 s window).
      */
     fun touch(videoId: String) {
-        val e = entries[videoId] ?: return
-        entries[videoId] = Entry(e.positionMs, System.currentTimeMillis())
-        scheduleFlush()
+        // computeIfPresent is atomic per key: a concurrent put() between a
+        // get() and a store would otherwise be overwritten with a stale (or
+        // missing) position.
+        val updated = entries.computeIfPresent(videoId) { _, cur ->
+            Entry(cur.positionMs, System.currentTimeMillis())
+        }
+        if (updated != null) scheduleFlush()
     }
 
     private fun scheduleFlush() {
@@ -128,7 +132,15 @@ object ResumeStore {
                         .put(KEY_UPDATED, e.updatedAt))
                 }
                 file.parentFile?.mkdirs()
-                file.writeText(root.toString())
+                // Write-then-rename: a crash mid-write must not leave a torn
+                // JSON, which the next init() would discard (losing every
+                // resume point).
+                val tmp = File(file.parentFile, file.name + ".fbar_tmp")
+                tmp.writeText(root.toString())
+                if (!tmp.renameTo(file)) {
+                    file.writeText(root.toString())
+                    tmp.delete()
+                }
             }.onFailure { L.w(TAG, "store flush failed", it) }
         }
     }

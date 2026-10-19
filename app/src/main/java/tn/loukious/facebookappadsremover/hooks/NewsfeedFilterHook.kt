@@ -113,10 +113,17 @@ object NewsfeedFilterHook {
         return runCatching {
             onLayout.isAccessible = true
             module.hook(onLayout).intercept(AiUiFallbackHook)
-            View::class.java.getDeclaredMethod(
-                "setContentDescription", CharSequence::class.java,
-            ).let { module.hook(it).intercept(AiDescriptionHook) }
+            // Commit as soon as the primary hook is in: if the secondary
+            // semantic-label hook below throws, a retry would otherwise hook
+            // onLayout a second time (double scan + double dispose risk).
             uiFallbackInstalled = true
+            runCatching {
+                View::class.java.getDeclaredMethod(
+                    "setContentDescription", CharSequence::class.java,
+                ).let { module.hook(it).intercept(AiDescriptionHook) }
+            }.onFailure {
+                L.w(TAG, "semantic-label hook failed (layout fallback stays active)", it)
+            }
             L.i(TAG, "AI-content UI fallback installed (RecyclerView layout + semantic label)")
             true
         }.getOrElse {
@@ -356,6 +363,8 @@ object NewsfeedFilterHook {
         }.getOrNull()
         private val hiddenRows = Collections.synchronizedMap(WeakHashMap<View, HiddenRowState>())
         @Volatile private var lastScanLogMs = 0L
+        /** Only touched from the UI thread (RecyclerView.onLayout). */
+        private var pendingScan: Runnable? = null
 
         private class UiScan {
             var providers = 0
@@ -381,9 +390,15 @@ object NewsfeedFilterHook {
             // Do not create Litho accessibility nodes during mount/layout: that
             // can mutate Facebook's accessibility tree while it is assembling.
             // Query already-mounted virtual nodes on the next idle frame only.
-            recycler.postDelayed({
+            // Coalesce: a burst of layouts (scroll) must not queue one full
+            // tree walk per frame.
+            pendingScan?.let { recycler.removeCallbacks(it) }
+            val scan = Runnable {
+                pendingScan = null
                 if (recycler.isAttachedToWindow) scanRecycler(recycler)
-            }, 650L)
+            }
+            pendingScan = scan
+            recycler.postDelayed(scan, 650L)
             return result
         }
 

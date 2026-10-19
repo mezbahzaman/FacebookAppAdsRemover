@@ -23,7 +23,7 @@ object MethodCache {
      */
     private const val KEY_SCHEMA = "schema"
     private const val KEY_MODULE_VERSION = "moduleVersion"
-    private const val CACHE_SCHEMA = 4 // Removed shopping guard + split ad families.
+    private const val CACHE_SCHEMA = 5 // Array parameter names round-trip (was 4).
     private const val KEY_TARGETS = "targets" // "key=Class#m:p,p;Class#m:p;\n..." per line
     private const val KEY_CLASS_PREFIX = "class:"
 
@@ -86,7 +86,7 @@ object MethodCache {
             sb.append(key).append('=')
             for (m in list) {
                 sb.append(m.declaringClass.name).append('#').append(m.name)
-                sb.append(':').append(m.parameterTypes.joinToString(",") { it.name })
+                sb.append(':').append(m.parameterTypes.joinToString(",") { paramName(it) })
                 sb.append(';')
             }
             sb.append('\n')
@@ -116,6 +116,13 @@ object MethodCache {
         cls.getDeclaredMethod(name, *params.toTypedArray())
     }.getOrNull()
 
+    /**
+     * Binary name used inside a cache record. Object-array names
+     * ("[Ljava.lang.String;") carry a trailing ';' which is the record
+     * separator, so it is stripped here and restored in [resolveType].
+     */
+    private fun paramName(type: Class<*>): String = type.name.removeSuffix(";")
+
     private fun resolveType(name: String, cl: ClassLoader): Class<*>? = when (name) {
         "void" -> java.lang.Void.TYPE
         "boolean" -> java.lang.Boolean.TYPE
@@ -126,7 +133,15 @@ object MethodCache {
         "float" -> java.lang.Float.TYPE
         "double" -> java.lang.Double.TYPE
         "char" -> java.lang.Character.TYPE
-        else -> runCatching { Class.forName(name, false, cl) }.getOrNull()
+        else -> runCatching {
+            // Restore the ';' stripped by paramName for object-array types.
+            val binary = if (name.startsWith("[") && name.contains('L') && !name.endsWith(";")) {
+                "$name;"
+            } else {
+                name
+            }
+            Class.forName(binary, false, cl)
+        }.getOrNull()
     }
 
     private fun versionCode(context: Context): Int = runCatching {

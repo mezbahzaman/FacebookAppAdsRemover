@@ -43,16 +43,20 @@ object LauncherIcon {
     /**
      * Shows or hides the drawer icon. DONT_KILL_APP keeps this settings screen
      * alive — the change needs no process restart, and killing it would close
-     * the very screen the user just flipped the switch on.
+     * the very screen the user just flipped the switch on. Returns false when
+     * PackageManager rejected the change, so the caller can revert the switch
+     * instead of showing a state that does not match reality.
      */
-    fun setVisible(context: Context, visible: Boolean) {
-        runCatching {
-            context.packageManager.setComponentEnabledSetting(
-                component(context),
-                if (visible) PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                else PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP,
-            )
-        }
+    fun setVisible(context: Context, visible: Boolean): Boolean = runCatching {
+        context.packageManager.setComponentEnabledSetting(
+            component(context),
+            if (visible) PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            else PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+            PackageManager.DONT_KILL_APP,
+        )
+        true
+    }.getOrElse {
+        android.util.Log.w("FBAR.Launcher", "setComponentEnabledSetting(visible=$visible) failed", it)
+        false
     }
 }

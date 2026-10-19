@@ -13,6 +13,7 @@ import io.github.libxposed.api.XposedModule
 object L {
 
     @JvmStatic
+    @Volatile
     var module: ModuleMain? = null
 
     fun i(tag: String, msg: String) {

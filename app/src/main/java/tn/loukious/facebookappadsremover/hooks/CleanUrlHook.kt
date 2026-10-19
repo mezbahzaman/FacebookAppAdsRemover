@@ -57,11 +57,9 @@ object CleanUrlHook {
     /** Toggle key (mod pref: app.telegram.bemai3012_swFbclid). */
     const val KEY = "links.cleanUrl"
 
-    /** Mod's unwrap pattern (DAT_00fe0ed8): everything up to the encoded
-     *  param boundary that precedes fbclid, group 1 = the real destination. */
-    private val LPHP_PATTERN =
-        Regex(".+?l\\.php\\?u=(.+?)(%26|%3F)fbclid.+")
-
+    /** Mod's unwrap pattern (DAT_00fe0ed8) required an *encoded* separator
+     *  (%26/%3F) before fbclid, which stock Facebook never emits, so the
+     *  unwrap never fired; see [extractDestination] for the real parse. */
     private var installed = false
 
     /**
@@ -106,13 +104,36 @@ object CleanUrlHook {
         if (!Settings.getBoolean(KEY, false)) return
         val intent = chain.args.getOrNull(0) as? Intent ?: return
         val url = intent.dataString ?: return
-        // Mod gate: url.contains("fbclid") (DAT_00fe0e98) — redundant with
-        // the pattern but faithful.
+        // Mod gate: url.contains("fbclid") (DAT_00fe0e98).
         if (!url.contains("fbclid")) return
-        val match = LPHP_PATTERN.matchEntire(url) ?: return
-        val unwrapped = URLDecoder.decode(match.groupValues[1], "utf-8")
-        if (unwrapped.isEmpty()) return
+        val unwrapped = extractDestination(url) ?: return
         intent.data = Uri.parse(unwrapped)
         L.i(TAG, "l.php unwrapped:\n  from: $url\n  to:   $unwrapped")
     }
+}
+
+/**
+ * Extracts the real destination from a Facebook l.php redirect.
+ *
+ * Real shape: `https://…/l.php?u=https%3A%2F%2Fexample.com%2Fx%3Fa%3D1&fbclid=…`.
+ * The `u` value is percent-encoded, so separators inside the destination are
+ * `%26`; the value therefore ends at the first *raw* `&`. The decoded mod
+ * pattern only accepted an encoded separator before `fbclid`, which never
+ * matches these links — the feature silently did nothing. Here the query is
+ * parsed instead, `u` may appear at any position, and only http(s)
+ * destinations are accepted (an unwrap must never introduce a different
+ * scheme such as `intent:`/`file:` into the outgoing intent).
+ *
+ * Returns null when the URL is not an l.php wrapper or the destination is
+ * unusable.
+ */
+internal fun extractDestination(url: String): String? {
+    val marker = url.indexOf("l.php?")
+    if (marker < 0) return null
+    val query = url.substring(marker + "l.php?".length)
+    val value = query.split('&').firstOrNull { it.startsWith("u=") }?.substring(2)
+    if (value.isNullOrEmpty()) return null
+    val decoded = runCatching { URLDecoder.decode(value, "utf-8") }.getOrNull() ?: return null
+    if (!decoded.startsWith("http://") && !decoded.startsWith("https://")) return null
+    return decoded
 }

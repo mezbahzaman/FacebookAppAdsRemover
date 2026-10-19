@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
 import android.widget.Toast
@@ -51,6 +52,19 @@ import java.util.Locale
 object SessionBackup {
 
     private const val TAG = "FBAR.Session"
+
+    /**
+     * Signature-level permission (declared in AndroidManifest.xml) required
+     * to send command broadcasts to the receiver inside the FB process.
+     * Only apps signed with the module's certificate — i.e. the module app
+     * itself — hold it, so no third party can force an export or a restore.
+     *
+     * Note: the RESULT broadcast (FB → module app) cannot use this
+     * permission, because Facebook is signed by a different key and would
+     * never hold it; its impact is limited to spoofed toasts in the module
+     * app (no data access), so that direction stays unprotected by design.
+     */
+    const val PERMISSION = "tn.loukious.facebookappadsremover.permission.SESSION_BACKUP"
 
     /** Broadcast actions the module app sends (target com.facebook.katana). */
     const val ACTION_EXPORT = "tn.loukious.facebookappadsremover.action.SESSION_EXPORT"
@@ -114,11 +128,13 @@ object SessionBackup {
                 addAction(ACTION_IMPORT_DATA)
             }
             if (Build.VERSION.SDK_INT >= 33) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+                // broadcastPermission restricts SENDERS: only callers holding
+                // the signature permission (the module app) can reach us.
+                context.registerReceiver(receiver, filter, PERMISSION, null, Context.RECEIVER_EXPORTED)
             } else {
-                context.registerReceiver(receiver, filter)
+                context.registerReceiver(receiver, filter, PERMISSION, null)
             }
-            L.i(TAG, "session backup receiver registered")
+            L.i(TAG, "session backup receiver registered (permission-protected)")
         }.onFailure { L.e(TAG, "session backup receiver registration failed", it) }
     }
 
@@ -206,11 +222,23 @@ object SessionBackup {
         // path. A path whose parent dir no longer exists (FB layout change
         // between export and import) is skipped, not fatal.
         val dataDir = context.dataDir
+        val base = dataDir.canonicalFile
         var written = 0
         val keys = files.keys()
         while (keys.hasNext()) {
             val rel = keys.next()
             val target = File(dataDir, rel)
+            // Containment check on the canonical path: an export edited by
+            // hand (or crafted by another app) must not escape FB's data dir
+            // via "../" segments or symlinks — we would otherwise write
+            // arbitrary files with Facebook's UID.
+            val canonical = runCatching { target.canonicalFile }.getOrNull()
+            if (canonical == null ||
+                !(canonical.path == base.path || canonical.path.startsWith(base.path + File.separator))
+            ) {
+                L.e(TAG, "import skip (outside data dir): $rel")
+                continue
+            }
             if (target.parentFile?.exists() != true) {
                 L.e(TAG, "import skip (no parent dir): $rel")
                 continue
@@ -274,39 +302,80 @@ object SessionBackup {
     }.getOrDefault(false)
 
     /** Contributes a file to MediaStore Downloads (pending → write → publish). */
-    private fun writeMediaStore(context: Context, displayName: String, bytes: ByteArray): Boolean = runCatching {
-        val resolver = context.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, displayName)
-            put(MediaStore.Downloads.MIME_TYPE, "application/json")
-            put(MediaStore.Downloads.RELATIVE_PATH, EXPORT_DIR)
-            put(MediaStore.Downloads.IS_PENDING, 1)
+    private fun writeMediaStore(context: Context, displayName: String, bytes: ByteArray): Boolean {
+        // MediaStore.Downloads only exists on API 29+ (minSdk is 27 — the
+        // class reference would throw NoClassDefFoundError on 8.1/9).
+        if (Build.VERSION.SDK_INT < 29) return writeLegacyDownloads(displayName, bytes)
+        var uri: Uri? = null
+        return runCatching {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+                put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                put(MediaStore.Downloads.RELATIVE_PATH, EXPORT_DIR)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("MediaStore insert returned null")
+            resolver.openOutputStream(uri!!)?.use { it.write(bytes) }
+                ?: error("openOutputStream returned null")
+            val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+            if (resolver.update(uri!!, done, null, null) <= 0) error("publish update made no row visible")
+            true
+        }.getOrElse {
+            L.e(TAG, "MediaStore write failed", it)
+            // Never leave a pending (invisible) orphan row behind.
+            uri?.let { u -> runCatching { context.contentResolver.delete(u, null, null) } }
+            false
         }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: return@runCatching false
-        resolver.openOutputStream(uri)?.use { it.write(bytes) }
-            ?: return@runCatching false
-        val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
-        resolver.update(uri, done, null, null)
-        true
+    }
+
+    /**
+     * Pre-29 export: direct write into the public Downloads dir (FB holds
+     * WRITE_EXTERNAL_STORAGE on these OS versions). Same atomic pattern.
+     */
+    private fun writeLegacyDownloads(displayName: String, bytes: ByteArray): Boolean = runCatching {
+        val dir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "FacebookAppAdsRemover",
+        )
+        dir.mkdirs()
+        atomicWrite(File(dir, displayName), bytes)
     }.getOrElse {
-        L.e(TAG, "MediaStore write failed", it)
+        L.e(TAG, "legacy export write failed", it)
         false
     }
 
     /** The most recent FBAR-Session-*.json in Downloads (own contributions — no permission needed). */
-    private fun latestExport(context: Context): Uri? = runCatching {
-        context.contentResolver.query(
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-            arrayOf(MediaStore.Downloads._ID),
-            "${MediaStore.Downloads.DISPLAY_NAME} LIKE ?",
-            arrayOf("$EXPORT_PREFIX%"),
-            "${MediaStore.Downloads.DATE_ADDED} DESC",
-        )?.use { c -> if (c.moveToFirst()) c.getLong(0) else null }
-            ?.let { id ->
-                Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
-            }
-    }.getOrNull()
+    private fun latestExport(context: Context): Uri? {
+        if (Build.VERSION.SDK_INT >= 29) {
+            return runCatching {
+                context.contentResolver.query(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Downloads._ID),
+                    "${MediaStore.Downloads.DISPLAY_NAME} LIKE ?",
+                    arrayOf("$EXPORT_PREFIX%"),
+                    "${MediaStore.Downloads.DATE_ADDED} DESC",
+                )?.use { c -> if (c.moveToFirst()) c.getLong(0) else null }
+                    ?.let { id ->
+                        Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id.toString())
+                    }
+            }.onFailure {
+                L.e(TAG, "latestExport query failed", it)
+            }.getOrNull()
+        }
+        return runCatching {
+            File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "FacebookAppAdsRemover",
+            ).listFiles()
+                ?.filter { it.isFile && it.name.startsWith(EXPORT_PREFIX) }
+                ?.maxByOrNull { it.lastModified() }
+                ?.let { Uri.fromFile(it) }
+        }.onFailure {
+            L.e(TAG, "latestExport legacy scan failed", it)
+        }.getOrNull()
+    }
 
     /** FB-side toast (visible only when FB is foreground) + module-app result. */
     private fun toast(context: Context, ok: Boolean, message: String) {

@@ -142,7 +142,7 @@ object Settings {
      *  no-overlay variant changes audible behaviour, so it ships off. */
     const val VIDEO_BACKGROUND = "media.video.background"
 
-    private var prefs: SharedPreferences? = null
+    @Volatile private var prefs: SharedPreferences? = null
 
     /**
      * Picks the prefs source for the Facebook process. Call once from

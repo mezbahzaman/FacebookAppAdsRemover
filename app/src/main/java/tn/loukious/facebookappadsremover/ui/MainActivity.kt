@@ -43,11 +43,45 @@ import io.github.libxposed.service.XposedServiceHelper
  */
 class MainActivity : AppCompatActivity() {
 
-    private var prefs: SharedPreferences? = null
+    @Volatile private var prefs: SharedPreferences? = null
     private var serviceBound = false
     private var resyncing = false
     private lateinit var serviceHint: TextView
     private lateinit var togglesList: LinearLayout
+
+    private companion object {
+        /**
+         * libxposed keeps ONE process-static listener (no unregister) and
+         * clears its cached binder after the first registration. So:
+         *  - the listener must not capture the activity (the static would leak
+         *    it past onDestroy) — it reaches the current instance through
+         *    [activityRef];
+         *  - a recreated activity must replay the last bound service, or the
+         *    switches would stay locked forever after e.g. a rotation.
+         * The remote-preference reads/writes (migrations) are binder calls and
+         * run on [migrations] instead of the main thread.
+         */
+        @Volatile private var activityRef: java.lang.ref.WeakReference<MainActivity>? = null
+        @Volatile private var lastService: XposedService? = null
+        private val migrations = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "fbar-settings-migrations")
+        }
+        private val serviceListener = object : XposedServiceHelper.OnServiceListener {
+            override fun onServiceBind(service: XposedService) {
+                // Record on the listener (not just the activity): a bind may
+                // arrive while no activity is attached, and registerListener
+                // never redelivers it — the replayed copy in onCreate is the
+                // only chance a later activity gets, so it must exist here.
+                lastService = service
+                activityRef?.get()?.onServiceBind(service)
+            }
+
+            override fun onServiceDied(service: XposedService) {
+                lastService = null
+                activityRef?.get()?.handleServiceDied()
+            }
+        }
+    }
 
     /**
      * System file browser for importing a specific session export. The FB
@@ -88,19 +122,43 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
-            override fun onServiceBind(service: XposedService) {
-                prefs = runCatching { service.getRemotePreferences(Settings.NAME) }.getOrNull()
-                migrateFromLocalStorage()
-                migrateSplitAdToggles()
-                runOnUiThread { onServiceReady() }
-            }
+        activityRef = java.lang.ref.WeakReference(this)
+        XposedServiceHelper.registerListener(serviceListener)
+        // registerListener only delivers a binder it has not yet handed out;
+        // an already-consumed one has to be replayed or a recreated activity
+        // would never see the service.
+        lastService?.let { onServiceBind(it) }
+    }
 
-            override fun onServiceDied(service: XposedService) {
-                prefs = null
-                runOnUiThread { onServiceGone() }
+    /**
+     * Called from the (main) binder-delivery path, but every binder call is
+     * pushed to [migrations] — getRemotePreferences() and the migrations are
+     * binder round-trips and must not run on the main thread. The UI is only
+     * touched back on the main thread.
+     */
+    private fun onServiceBind(service: XposedService) {
+        migrations.execute {
+            val remote = runCatching { service.getRemotePreferences(Settings.NAME) }.getOrNull()
+            if (remote == null) {
+                android.util.Log.w("FBAR.Settings", "getRemotePreferences returned null for ${Settings.NAME}")
+                runOnUiThread { serviceHint.text = getString(R.string.service_unavailable) }
+                return@execute
             }
-        })
+            prefs = remote
+            migrateFromLocalStorage()
+            migrateSplitAdToggles()
+            runOnUiThread { onServiceReady() }
+        }
+    }
+
+    private fun handleServiceDied() {
+        prefs = null
+        runOnUiThread { onServiceGone() }
+    }
+
+    override fun onDestroy() {
+        if (activityRef?.get() === this) activityRef = null
+        super.onDestroy()
     }
 
     private fun onServiceReady() {
@@ -263,7 +321,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendSession(action: String) {
         val intent = Intent(action).setPackage("com.facebook.katana")
-        val sent = runCatching { sendBroadcast(intent) }.isSuccess
+        // The FB-side receiver requires this signature permission; without it
+        // the broadcast is refused (and third-party apps cannot send it).
+        val sent = runCatching { sendBroadcast(intent, SessionBackup.PERMISSION) }.isSuccess
         Toast.makeText(
             this,
             if (sent) "Asking Facebook…" else "Broadcast failed — is Facebook installed?",
@@ -289,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(SessionBackup.ACTION_IMPORT_DATA)
             .setPackage("com.facebook.katana")
             .putExtra(SessionBackup.EXTRA_DATA, text)
-        runCatching { sendBroadcast(intent) }
+        runCatching { sendBroadcast(intent, SessionBackup.PERMISSION) }
             .onSuccess { Toast.makeText(this, "Asking Facebook…", Toast.LENGTH_SHORT).show() }
             .onFailure {
                 Toast.makeText(this, "Broadcast failed — is Facebook installed?", Toast.LENGTH_SHORT).show()
@@ -377,16 +437,19 @@ class MainActivity : AppCompatActivity() {
         // Reverting from inside the listener re-enters it; this is the same
         // guard the prefs switches use via `resyncing`.
         var reverting = false
-        fun revert() {
+        fun revert(to: Boolean) {
             reverting = true
-            switch.isChecked = true
+            switch.isChecked = to
             reverting = false
         }
 
         switch.setOnCheckedChangeListener { _, checked ->
             if (reverting) return@setOnCheckedChangeListener
             if (checked) {
-                LauncherIcon.setVisible(this, true)
+                if (!LauncherIcon.setVisible(this, true)) {
+                    Toast.makeText(this, "Couldn't show the icon", Toast.LENGTH_SHORT).show()
+                    revert(false)
+                }
                 return@setOnCheckedChangeListener
             }
             AlertDialog.Builder(this)
@@ -400,9 +463,14 @@ class MainActivity : AppCompatActivity() {
                 // Both the button and a back/outside dismissal must put the
                 // switch back, or it would read "hidden" while the icon is
                 // still in the drawer.
-                .setNegativeButton("Cancel") { _, _ -> revert() }
-                .setOnCancelListener { revert() }
-                .setPositiveButton("Hide") { _, _ -> LauncherIcon.setVisible(this, false) }
+                .setNegativeButton("Cancel") { _, _ -> revert(true) }
+                .setOnCancelListener { revert(true) }
+                .setPositiveButton("Hide") { _, _ ->
+                    if (!LauncherIcon.setVisible(this, false)) {
+                        Toast.makeText(this, "Couldn't hide the icon", Toast.LENGTH_SHORT).show()
+                        revert(true)
+                    }
+                }
                 .show()
         }
     }
