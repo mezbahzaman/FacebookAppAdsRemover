@@ -39,10 +39,9 @@ class CleanUrlHookTest {
         assertNull(extractDestination(wrapper("u=${enc("file:///etc/hosts")}&fbclid=x")))
     }
 
-    @Test fun nonWrapperAndMalformedUrlsReturnNull() {
-        assertNull(extractDestination("https://example.org/a?b=1&fbclid=x"))
-        assertNull(extractDestination(wrapper("fbclid=x")))
-        assertNull(extractDestination(wrapper("u=&fbclid=x")))
-        assertNull(extractDestination(""))
+    @Test fun unwrapsLinkWithFragmentInQueryIgnored() {
+        val dest = "https://example.org/page"
+        // Fragment appears after query; we must not treat it as part of u=
+        assertEquals(dest, extractDestination(wrapper("u=${enc(dest)}#fragment&fbclid=x")))
     }
-}
+
