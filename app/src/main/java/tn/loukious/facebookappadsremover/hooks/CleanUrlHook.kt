@@ -130,7 +130,10 @@ object CleanUrlHook {
 internal fun extractDestination(url: String): String? {
     val marker = url.indexOf("l.php?")
     if (marker < 0) return null
-    val query = url.substring(marker + "l.php?".length)
+    val queryStart = marker + "l.php?".length
+    // Cut at fragment if present
+    val queryEnd = url.indexOf('#', queryStart)
+    val query = if (queryEnd >= 0) url.substring(queryStart, queryEnd) else url.substring(queryStart)
     val value = query.split('&').firstOrNull { it.startsWith("u=") }?.substring(2)
     if (value.isNullOrEmpty()) return null
     val decoded = runCatching { URLDecoder.decode(value, "utf-8") }.getOrNull() ?: return null
