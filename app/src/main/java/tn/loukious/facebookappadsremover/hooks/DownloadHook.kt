@@ -496,7 +496,9 @@ object DownloadHook {
     /** Native reel-sidebar entry point: open this item's existing quality picker. */
     fun openReelDownload(context: Context?, playerHost: Any?): Boolean {
         if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
-        val videoId = videoIdFromPlayerParamsIn(playerHost) ?: return false
+        val videoId = videoIdFromPlayerParamsIn(playerHost)
+            ?: activeVideoId
+            ?: return false
         val data = videoById(videoId) ?: return false
         val activity = context as? Activity ?: currentActivity ?: return false
         main.post { openQuickDownload(activity, data) }
@@ -506,7 +508,9 @@ object DownloadHook {
     /** Native reel-sidebar entry point for the existing Page repost flow. */
     fun openReelRepost(context: Context?, playerHost: Any?): Boolean {
         if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
-        val videoId = videoIdFromPlayerParamsIn(playerHost) ?: return false
+        val videoId = videoIdFromPlayerParamsIn(playerHost)
+            ?: activeVideoId
+            ?: return false
         val data = videoById(videoId) ?: return false
         val activity = context as? Activity ?: currentActivity ?: return false
         main.post { Repost.open(activity, data) }
@@ -2151,8 +2155,8 @@ object DownloadHook {
                 fetchCache[data.videoId] = fetched
                 L.i(TAG, "qualities prefetched for ${data.videoId}: " +
                         "${fetched.extras.size} rendition(s)")
-                onDone?.invoke()
             }
+            onDone?.invoke()
         }
     }
 
