@@ -1183,14 +1183,9 @@ object DownloadHook {
     /**
      * Reads the controller's GraphQLMedia + VideoPlayerParams (both by stable
      * type) and runs the mod's extraction pipeline on the dump. videoId comes
-     * from params.toString() ("VideoId: <id>"); when the controller has not had
-     * its params attached yet the capture is skipped rather than guessed.
-     *
-     * The previous code fell back to the freshest params-ctor observation,
-     * which can belong to a different (prefetched/next) video — that attached
-     * one video's DASH ladder to another video's card. A missing rich capture
-     * is harmless (the params-ctor hook still records the SD/HD pair); a
-     * misattributed one is not.
+     * from params.toString() ("VideoId: <id>") and falls back to the freshest
+     * params-ctor observation when the controller instance was built before
+     * playback params were attached.
      */
     private fun onMediaSetup(controller: Any?) {
         val paramsField = mediaParamsField ?: return
@@ -1199,6 +1194,7 @@ object DownloadHook {
         val params = runCatching { paramsField.get(controller) }.getOrNull()
         val videoId = params?.toString()?.removePrefix(VIDEO_ID_MARKER)
             ?.takeIf { it.isNotBlank() && it != NULL_MARKER }
+            ?: lastParamsVideoId?.takeIf { it.isNotBlank() && it != NULL_MARKER }
             ?: return
 
         // Same video: re-capture at most every 5s (the mod's freshness gate).
