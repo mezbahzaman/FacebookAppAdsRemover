@@ -499,7 +499,15 @@ object DownloadHook {
         val videoId = videoIdFromPlayerParamsIn(playerHost)
             ?: activeVideoId
             ?: return false
-        val data = videoById(videoId) ?: return false
+        val data = videoById(videoId) ?: VideoData(
+            videoId = videoId,
+            mediaDump = "",
+            qualities = emptyList(),
+            audioUrl = null,
+            postUrl = WATCH_PREFIX + videoId,
+            thumbnailUrl = null,
+            playlist = null,
+        )
         val activity = context as? Activity ?: currentActivity ?: return false
         main.post { openQuickDownload(activity, data) }
         return true
@@ -511,7 +519,15 @@ object DownloadHook {
         val videoId = videoIdFromPlayerParamsIn(playerHost)
             ?: activeVideoId
             ?: return false
-        val data = videoById(videoId) ?: return false
+        val data = videoById(videoId) ?: VideoData(
+            videoId = videoId,
+            mediaDump = "",
+            qualities = emptyList(),
+            audioUrl = null,
+            postUrl = WATCH_PREFIX + videoId,
+            thumbnailUrl = null,
+            playlist = null,
+        )
         val activity = context as? Activity ?: currentActivity ?: return false
         main.post { Repost.open(activity, data) }
         return true
