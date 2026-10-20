@@ -359,10 +359,11 @@ class MainActivity : AppCompatActivity() {
     private fun addSectionHeader(parent: ViewGroup, title: String) {
         val tv = TextView(this)
         tv.text = title
-        tv.textSize = 13f
+        tv.textSize = 12f
         tv.isAllCaps = true
-        tv.letterSpacing = 0.1f
-        tv.setPadding(dp(4), dp(24), dp(4), dp(8))
+        tv.letterSpacing = 0.12f
+        tv.alpha = 0.6f
+        tv.setPadding(dp(4), dp(28), dp(4), dp(12))
         parent.addView(tv)
     }
 
@@ -387,7 +388,7 @@ class MainActivity : AppCompatActivity() {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(4), dp(10), dp(4), dp(10))
+        row.setPadding(dp(4), dp(12), dp(4), dp(12))
 
         val text = LinearLayout(this)
         text.orientation = LinearLayout.VERTICAL
@@ -401,7 +402,8 @@ class MainActivity : AppCompatActivity() {
         val subtitleView = TextView(this)
         subtitleView.text = subtitle
         subtitleView.textSize = 13f
-        subtitleView.setPadding(0, dp(2), 0, 0)
+        subtitleView.alpha = 0.75f
+        subtitleView.setPadding(0, dp(3), dp(16), 0)
         text.addView(subtitleView)
         row.addView(text)
 

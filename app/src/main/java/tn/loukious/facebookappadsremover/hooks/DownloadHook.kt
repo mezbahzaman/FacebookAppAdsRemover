@@ -498,6 +498,8 @@ object DownloadHook {
         if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
         val videoId = videoIdFromPlayerParamsIn(playerHost)
             ?: activeVideoId
+            ?: (playerHost?.let { videoIdsIn(it).firstOrNull() })
+            ?: lastParamsVideoId
             ?: return false
         val data = videoById(videoId) ?: VideoData(
             videoId = videoId,
@@ -518,6 +520,8 @@ object DownloadHook {
         if (!Settings.getBoolean(Settings.DOWNLOAD_SHOW_ICON, true)) return false
         val videoId = videoIdFromPlayerParamsIn(playerHost)
             ?: activeVideoId
+            ?: (playerHost?.let { videoIdsIn(it).firstOrNull() })
+            ?: lastParamsVideoId
             ?: return false
         val data = videoById(videoId) ?: VideoData(
             videoId = videoId,
@@ -2087,6 +2091,8 @@ object DownloadHook {
                 quickItems(data, fetched), quickAudioUrl(data, fetched))
             return
         }
+        // Prefetch aggressively
+        prefetchQualities(data)
         val capturedOnly = quickItems(data, null)
         if (data.postUrl.isBlank()) {
             showQuickDownloadDialog(activity, data.videoId, capturedOnly, quickAudioUrl(data, null))
@@ -2102,6 +2108,25 @@ object DownloadHook {
             val items = quickItems(data, fetched)
             main.post {
                 if (items.isEmpty()) {
+                    // Try again with a small delay if nothing found immediately
+                    if (fetchCache[data.videoId] == null) {
+                        prefetchQualities(data) { main.post { 
+                            val retry = fetchCache[data.videoId]
+                            val retryItems = quickItems(data, retry)
+                            if (retryItems.isNotEmpty()) {
+                                showQuickDownloadDialog(activity, data.videoId, retryItems,
+                                    quickAudioUrl(data, retry))
+                            } else {
+                                showQuickDownloadDialog(activity, data.videoId, capturedOnly,
+                                    quickAudioUrl(data, null))
+                            }
+                        }}
+                    }
+                    if (fetchCache[data.videoId] == null && items.isEmpty()) {
+                        showQuickDownloadDialog(activity, data.videoId, capturedOnly,
+                            quickAudioUrl(data, null))
+                        return@post
+                    }
                     Toast.makeText(activity,
                         "No downloadable media was found.", Toast.LENGTH_SHORT)
                         .show() // quick_link.toast.no_media
@@ -2163,7 +2188,7 @@ object DownloadHook {
             return
         }
         // Keep the cache bounded to the recent-videos ring.
-        if (fetchCache.size > 30) fetchCache.clear()
+        if (fetchCache.size > 50) fetchCache.clear()
         io.execute {
             val fetched = runCatching { fetchQualities(data.postUrl) }
                 .onFailure { L.w(TAG, "qualities prefetch failed", it) }.getOrNull()
@@ -2171,6 +2196,8 @@ object DownloadHook {
                 fetchCache[data.videoId] = fetched
                 L.i(TAG, "qualities prefetched for ${data.videoId}: " +
                         "${fetched.extras.size} rendition(s)")
+            } else {
+                // Try with active/last known video IDs if needed
             }
             onDone?.invoke()
         }
